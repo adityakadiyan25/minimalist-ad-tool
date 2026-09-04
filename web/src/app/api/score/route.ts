@@ -28,6 +28,7 @@ const SEVERITY: Record<string, Severity> = {
   "5": "FLAG",
 };
 
+const ALL_RULE_IDS = ["1", "2a", "2b", "3", "4", "5"] as const;
 const MODEL_RULE_IDS = ["2a", "2b", "3", "4", "5"] as const;
 
 const BUCKETS = {
@@ -54,18 +55,18 @@ type ModelFinding = {
 
 /* ---------- rule 1: concentration mismatch, checked in code ---------- */
 
-type Active = { names: string[]; percent: number; title: string };
+type Active = { names: string[]; percent: number; title: string; handle: string };
 
 // "Salicylic Acid + LHA 2% Cleanser" -> names ["Salicylic Acid + LHA",
 // "Salicylic Acid", "LHA"], percent 2. A title with no percentage (e.g.
 // "SPF 50 Sunscreen") has no active to check against.
-function activeFromTitle(title: string): Active | null {
+function activeFromTitle(title: string, handle: string): Active | null {
   const m = title.match(/^(.*?)\s+(\d+(?:\.\d+)?)%/);
   if (!m) return null;
   const full = m[1].trim();
   const parts = full.split("+").map((s) => s.trim());
   const names = [full, ...parts].filter((n) => n.length > 1);
-  return { names: [...new Set(names)], percent: parseFloat(m[2]), title };
+  return { names: [...new Set(names)], percent: parseFloat(m[2]), title, handle };
 }
 
 type Token = { text: string; start: number; end: number };
@@ -80,8 +81,11 @@ function tokenize(text: string): Token[] {
   return tokens;
 }
 
+// Replaces, never deletes: a 1:1 swap keeps the normalized length equal to the
+// source length, so offsets map straight back. Deleting made "Alpha-Arbutin"
+// into "alphaarbutin", which no active name could ever match.
 function normalize(s: string): string {
-  return s.toLowerCase().replace(/[^a-z0-9+%. ]/g, "");
+  return s.toLowerCase().replace(/[^a-z0-9+%.]/g, " ");
 }
 
 type PercentHit = {
@@ -106,9 +110,40 @@ function findPercentages(text: string): PercentHit[] {
   return hits;
 }
 
-// Looks for an active's name within WINDOW_WORDS either side of a percentage.
-// Returns the character span covering both, so the finding can point at the
-// whole "Salicylic Acid + LHA 0.2%" rather than just the number.
+// Maps an offset in the normalized window text back to a character span in the
+// original ad text, by walking the window's tokens and their normalized lengths.
+function mapToChars(
+  window: Token[],
+  at: number,
+  length: number,
+): { start: number; end: number } | null {
+  let cursor = 0;
+  let start: number | null = null;
+  let end: number | null = null;
+  for (const token of window) {
+    const norm = normalize(token.text);
+    const tokenStart = cursor;
+    const tokenEnd = cursor + norm.length;
+    if (tokenEnd > at && start === null) start = token.start;
+    if (tokenStart < at + length) end = token.end;
+    cursor = tokenEnd + 1; // the space rejoined below
+  }
+  return start === null || end === null ? null : { start, end };
+}
+
+// Looks for the active whose concentration a percentage is stating.
+//
+// The name has to be immediately adjacent to the number — nothing but spaces and
+// punctuation between them. "Niacinamide 10%" states a concentration; "Flat 20%
+// off Niacinamide" and "Vitamin C 10%: 92% of users" do not, and neither does the
+// "100% vegan" that rules.md itself calls legitimate copy.
+//
+// When names sit on both sides, the one BEFORE the number wins: that is the form
+// all eight product titles use, and the form the brand's copy uses. Without it,
+// "Retinal 10% Niacinamide 10%" hands the 10% to Niacinamide, whose page says
+// 10%, and a 100x overstatement of a retinoid passes. Distance, then name length,
+// break what the first test leaves tied — which is what sends "Salicylic Acid +
+// LHA 0.2%" to the cleanser rather than to bare LHA.
 function nameNearPercent(
   text: string,
   tokens: Token[],
@@ -123,70 +158,112 @@ function nameNearPercent(
   const window = tokens.slice(from, to + 1);
   const windowText = normalize(window.map((t) => t.text).join(" "));
 
+  type Candidate = { name: string; start: number; end: number; precedes: boolean; distance: number };
+  let best: Candidate | null = null;
+
   for (const name of names) {
     const needle = normalize(name);
-    const at = windowText.indexOf(needle);
-    if (at === -1) continue;
+    if (needle.trim().length === 0) continue;
 
-    // Map the match back to a character span by walking the window's tokens.
-    let cursor = 0;
-    let nameStart: number | null = null;
-    let nameEnd: number | null = null;
-    for (const token of window) {
-      const norm = normalize(token.text);
-      const tokenStart = cursor;
-      const tokenEnd = cursor + norm.length;
-      if (tokenEnd > at && nameStart === null) nameStart = token.start;
-      if (tokenStart < at + needle.length) nameEnd = token.end;
-      cursor = tokenEnd + 1; // the space rejoined above
+    // Every occurrence, not just the first — the same active can appear twice
+    // in one window with only one of them next to this percentage.
+    for (let at = windowText.indexOf(needle); at !== -1; at = windowText.indexOf(needle, at + 1)) {
+      const chars = mapToChars(window, at, needle.length);
+      if (chars === null) continue;
+
+      const precedes = chars.end <= hit.start;
+      const follows = hit.end <= chars.start;
+      if (!precedes && !follows) continue; // overlapping the number itself
+
+      const between = precedes
+        ? text.slice(chars.end, hit.start)
+        : text.slice(hit.end, chars.start);
+      if (/[a-z0-9]/i.test(between)) continue; // a word sits in between: not a concentration
+
+      const candidate: Candidate = {
+        name,
+        start: Math.min(chars.start, hit.start),
+        end: Math.max(chars.end, hit.end),
+        precedes,
+        distance: between.length,
+      };
+
+      if (best === null || betterMatch(candidate, best)) best = candidate;
     }
-    if (nameStart === null || nameEnd === null) continue;
-
-    return {
-      name,
-      start: Math.min(nameStart, hit.start),
-      end: Math.max(nameEnd, hit.end),
-    };
   }
-  return null;
+
+  return best === null ? null : { name: best.name, start: best.start, end: best.end };
 }
 
-function scoreRule1(adText: string, product: Active | null, allActives: Active[]): Finding[] {
+function betterMatch(
+  a: { precedes: boolean; distance: number; name: string },
+  b: { precedes: boolean; distance: number; name: string },
+): boolean {
+  if (a.precedes !== b.precedes) return a.precedes;
+  if (a.distance !== b.distance) return a.distance < b.distance;
+  return normalize(a.name).trim().length > normalize(b.name).trim().length;
+}
+
+function scoreRule1(adText: string, selected: Active | null, all: Active[]): Finding[] {
   const findings: Finding[] = [];
   const tokens = tokenize(adText);
 
-  for (const hit of findPercentages(adText)) {
-    // With a product selected, its own actives are the source of truth.
-    if (product) {
-      const match = nameNearPercent(adText, tokens, hit, product.names);
-      if (match) {
-        if (hit.value !== product.percent) {
-          findings.push({
-            id: "1",
-            severity: SEVERITY["1"],
-            span: adText.slice(match.start, match.end),
-            fix: `Change ${hit.raw} to ${product.percent}% to match the product page ("${product.title}").`,
-          });
-        }
-        continue;
-      }
+  // An active belongs to whichever product titles name it. A routine ad names
+  // three products, so the selected one can't be the only source we check.
+  const owners = new Map<string, Active[]>();
+  for (const active of all) {
+    for (const name of active.names) {
+      const key = normalize(name);
+      owners.set(key, [...(owners.get(key) ?? []), active]);
     }
+  }
+  const names = [...new Set(all.flatMap((a) => a.names))];
 
-    // No product selected, or the ad names an active the selected product's
-    // title says nothing about. Either way there is no fact to check against.
-    const names = allActives.flatMap((a) => a.names);
+  for (const hit of findPercentages(adText)) {
     const match = nameNearPercent(adText, tokens, hit, names);
-    if (match) {
+    if (!match) continue;
+
+    const key = normalize(match.name);
+    const span = adText.slice(match.start, match.end);
+
+    // The dropdown is an override: when the selected product owns this active,
+    // its title is the source of truth even if another product shares the name.
+    const sources =
+      selected && selected.names.some((n) => normalize(n) === key)
+        ? [selected]
+        : owners.get(key) ?? [];
+
+    // An active no title accounts for. Unreachable while every recognised name
+    // comes from a title that carries a percentage, but it is the rule.
+    if (sources.length === 0) {
       findings.push({
         id: "1",
         severity: "REVIEW",
-        span: adText.slice(match.start, match.end),
-        fix: product
-          ? `Select the product this concentration belongs to, or check ${hit.raw} against its product page.`
-          : `Select the product this ad is for so ${hit.raw} can be checked against its product page.`,
+        span,
+        fix: `No product page accounts for ${match.name}. Check ${hit.raw} against its source.`,
         note: "no source to verify against",
       });
+      continue;
     }
+
+    if (sources.some((s) => s.percent === hit.value)) continue;
+
+    // Two products can share an active. They agree on the concentration today,
+    // so say the number once and name every title it came from.
+    const percents = [...new Set(sources.map((s) => s.percent))];
+    const titles = sources.map((s) => `"${s.title}"`).join(" or ");
+    const page = sources.length === 1 ? "the product page" : "a product page";
+    const expected =
+      percents.length === 1
+        ? `${percents[0]}% to match ${page} (${titles})`
+        : `match ${page}: ${sources.map((s) => `${s.percent}% ("${s.title}")`).join(" or ")}`;
+
+    findings.push({
+      id: "1",
+      severity: SEVERITY["1"],
+      span,
+      fix: `Change ${hit.raw} to ${expected}.`,
+    });
   }
 
   return findings;
@@ -215,10 +292,13 @@ async function scoreWithModel(adText: string, sourceFacts: string): Promise<Find
     fs.readFile(path.join(PROMPTS_DIR, "rules.md"), "utf8"),
   ]);
 
+  // replaceAll, not replace: a single-occurrence replace filled whichever
+  // mention came first in the file, which left the real sections holding
+  // literal {{...}} markers.
   const prompt = template
-    .replace("{{RULES}}", rules)
-    .replace("{{SOURCE_FACTS}}", sourceFacts)
-    .replace("{{AD_TEXT}}", adText);
+    .replaceAll("{{RULES}}", rules)
+    .replaceAll("{{SOURCE_FACTS}}", sourceFacts)
+    .replaceAll("{{AD_TEXT}}", adText);
 
   const client = new Anthropic();
   const response = await client.messages.create({
@@ -265,9 +345,10 @@ async function loadActives(): Promise<{ byHandle: Map<string, Active>; all: Acti
     const raw = await fs.readFile(path.join(PRODUCTS_DIR, file), "utf8");
     const title: unknown = JSON.parse(raw)?.product?.title;
     if (typeof title !== "string") continue;
-    const active = activeFromTitle(title);
+    const handle = file.replace(/\.json$/, "");
+    const active = activeFromTitle(title, handle);
     if (!active) continue;
-    byHandle.set(file.replace(/\.json$/, ""), active);
+    byHandle.set(handle, active);
     all.push(active);
   }
 
@@ -333,6 +414,7 @@ export async function POST(request: Request) {
 
   return NextResponse.json({
     verdict: verdictFor(findings),
+    rules_checked: ALL_RULE_IDS.length,
     policy: findings.filter((f) => BUCKETS.policy.includes(f.id as never)),
     tone: findings.filter((f) => BUCKETS.tone.includes(f.id as never)),
     language: findings.filter((f) => BUCKETS.language.includes(f.id as never)),

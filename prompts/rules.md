@@ -2,9 +2,11 @@
 
 This is the standard the scorer applies. The model's job is to say whether a rule fires and where in the text. This file decides how serious it is. The model doesn't get to decide severity.
 
-PASS means none of these rules fired. It doesn't mean the ad is compliant — there are only five rules right now.
+PASS means nothing fired that gates spend — no BLOCK, no REVIEW. A FLAG or an INFO can be sitting under a PASS; that is what they are for, the marketer sees them and decides. PASS also doesn't mean the ad is compliant — there are only six rule IDs right now: 1, 2a, 2b, 3, 4, 5.
 
-Severity: BLOCK stops export. REVIEW needs a human before spend. FLAG is advisory, the marketer sees it and decides.
+Severity: BLOCK stops export. REVIEW needs a human before spend. FLAG is advisory, the marketer sees it and decides. INFO is rule 4's one-marker case — the marketer sees it, nothing is asked of them.
+
+Buckets, which is how the scorer groups what it returns: policy is 1, 2a, 2b and 3. Tone is 4. Language is 5.
 
 Image references are to evidence/ad-library/. Product concentrations are the `title` field in evidence/products/*.json.
 
@@ -70,4 +72,45 @@ Fix: name the active and what it does.
 
 Why: every brand-run ad that makes a skin claim says what the ingredient does. Creator ads (batch1-01, batch1-03, batch1-04, batch2-03 left) sometimes name a product but never say what it does — "my saviour," "keeping my T-zone in check." This is the most reliable "sounds like Minimalist vs sounds like skincare" test I've found. Their homepage Transparency section says it directly: "Full disclosure of ingredients used & their concentration" — verify that wording on beminimalist.co before citing it.
 
+---
 
+## Implementation notes
+
+Decisions the scorer had to make that this file didn't settle. Recorded here so
+the next person doesn't have to read the route to find them.
+
+**Rule 1 only reads a percentage that is touching an active's name.** "A
+percentage next to an active" needed a definition. The test is that nothing but
+spaces and punctuation sits between the name and the number: "Niacinamide 10%",
+"10% Vitamin B5" and "Retinal (0.1%)" are concentration claims; "Flat 20% off
+Niacinamide", "Vitamin C 10%: 92% of users" and the "100% vegan" this file calls
+legitimate under rule 3 are not, and rule 1 leaves all three alone.
+
+Where names sit on both sides of a number, the one BEFORE it wins — the form
+every product title uses. Without that, "Retinal 10% Niacinamide 10%" hands the
+10% to Niacinamide, whose page says 10%, and a hundredfold overstatement of a
+retinoid reads as clean. Distance and then name length break what is still tied,
+which is what sends "Salicylic Acid + LHA 0.2%" to the cleanser and not to bare
+LHA.
+
+**Every active is checked against whichever title owns it, not just the selected
+one.** A routine ad names three products and only one can be picked in the
+dropdown, so checking against the selection alone made the other two products'
+correct concentrations look unverifiable. The dropdown is now an override: when
+the selected product owns the active, its title wins over any other title
+naming the same active.
+
+**Known gap: rule 1 only recognises the actives named in the eight titles.** The
+recognised names are parsed out of those titles — Alpha Arbutin, Niacinamide,
+Retinal, Salicylic Acid, LHA, Vitamin B5, Vitamin C. A percentage attached to an
+ingredient none of them names, "Retinol 1%" or "Hyaluronic Acid 2%", is not
+checked and produces nothing. The route still carries the REVIEW with "no source
+to verify against" for an active no title accounts for, but no input can reach it
+today. Closing this needs a decision about what counts as an ingredient name when
+the evidence doesn't have one, and guessing would flag "Flat 20% off" as an
+active. Open, not solved.
+
+**Thinking is off on the model call.** Output is capped at 1500 tokens and
+thinking tokens count against that cap, so leaving it on can truncate the JSON
+mid-object. If the model needs room to reason about a rule later, the cap moves
+first.

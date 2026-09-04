@@ -1,9 +1,15 @@
 # Scorer prompt — v0
 
-This file is the whole prompt. The route reads it verbatim and replaces three
-placeholders before sending it: `{{RULES}}` (the full contents of rules.md),
-`{{SOURCE_FACTS}}` (the product JSON, or a line saying there isn't one), and
-`{{AD_TEXT}}` (what the marketer pasted in). Nothing else is added.
+This file is the whole prompt. The route reads it verbatim and fills the three
+slots below before sending it: the rulebook slot takes the full contents of
+rules.md, the source-facts slot takes the product JSON (or a line saying there
+isn't one), and the ad-text slot takes what the marketer pasted in. Nothing else
+is added.
+
+The slots are written as double-braced names in the sections at the bottom of
+this file. Don't write one in this prose — every occurrence gets substituted,
+so a mention up here would paste the whole rulebook into the middle of a
+sentence.
 
 Rule 1 is not in here. It runs in code before this prompt is called, because a
 concentration is a number that either matches the product page or doesn't, and

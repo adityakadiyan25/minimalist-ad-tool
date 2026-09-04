@@ -12,28 +12,104 @@ type Finding = {
 
 type Result = {
   verdict: "BLOCK" | "REVIEW" | "PASS";
+  rules_checked: number;
   policy: Finding[];
   tone: Finding[];
   language: Finding[];
 };
 
-const BUCKET_LABELS: { key: keyof Omit<Result, "verdict">; label: string }[] = [
+type BucketKey = "policy" | "tone" | "language";
+
+const BUCKETS: { key: BucketKey; label: string }[] = [
   { key: "policy", label: "Policy" },
   { key: "tone", label: "Tone" },
   { key: "language", label: "Language" },
 ];
 
+function allFindings(result: Result): Finding[] {
+  return [...result.policy, ...result.tone, ...result.language];
+}
+
+// Merges the findings' spans into non-overlapping ranges over the ad text, so
+// the marketer can see where each one is rather than matching quotes by eye.
+function highlightRanges(adText: string, findings: Finding[]) {
+  const ranges: { start: number; end: number; ids: string[] }[] = [];
+
+  // Keyed by rule AND span, not span alone. One rule firing twice on the same
+  // words means two places in the ad, so the cursor advances. Two rules quoting
+  // the same headline means one place with two rule numbers on it, so each rule
+  // starts its own search and the merge below joins them.
+  const searchFrom = new Map<string, number>();
+
+  for (const finding of findings) {
+    if (!finding.span) continue;
+    const key = `${finding.id}\u0000${finding.span}`;
+    const from = searchFrom.get(key) ?? 0;
+    const start = adText.indexOf(finding.span, from);
+    if (start === -1) continue; // model returned a span that isn't in the text
+    searchFrom.set(key, start + finding.span.length);
+    ranges.push({ start, end: start + finding.span.length, ids: [finding.id] });
+  }
+
+  ranges.sort((a, b) => a.start - b.start || b.end - a.end);
+
+  const merged: typeof ranges = [];
+  for (const range of ranges) {
+    const last = merged[merged.length - 1];
+    if (last && range.start < last.end) {
+      last.end = Math.max(last.end, range.end);
+      for (const id of range.ids) if (!last.ids.includes(id)) last.ids.push(id);
+    } else {
+      merged.push({ ...range });
+    }
+  }
+  return merged;
+}
+
+function MarkedUpAd({ adText, findings }: { adText: string; findings: Finding[] }) {
+  const ranges = highlightRanges(adText, findings);
+  const nodes = [];
+  let cursor = 0;
+
+  for (const [i, range] of ranges.entries()) {
+    if (range.start > cursor) nodes.push(adText.slice(cursor, range.start));
+    nodes.push(
+      <mark key={i} style={{ background: "#ffe58f", color: "#171717", padding: "0 2px" }}>
+        {adText.slice(range.start, range.end)}
+        <span style={{ fontSize: 11, verticalAlign: "super", marginLeft: 2 }}>
+          {range.ids.join(",")}
+        </span>
+      </mark>,
+    );
+    cursor = range.end;
+  }
+  if (cursor < adText.length) nodes.push(adText.slice(cursor));
+
+  return (
+    <p
+      style={{
+        whiteSpace: "pre-wrap",
+        border: "1px solid #ccc",
+        padding: 12,
+        margin: "16px 0 0",
+      }}
+    >
+      {nodes}
+    </p>
+  );
+}
+
 export default function Scorer({ handles }: { handles: string[] }) {
   const [adText, setAdText] = useState("");
   const [handle, setHandle] = useState("none");
-  const [result, setResult] = useState<Result | null>(null);
+  const [scored, setScored] = useState<{ text: string; result: Result } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [scoring, setScoring] = useState(false);
 
   async function score() {
     setScoring(true);
     setError(null);
-    setResult(null);
+    setScored(null);
     try {
       const response = await fetch("/api/score", {
         method: "POST",
@@ -45,7 +121,9 @@ export default function Scorer({ handles }: { handles: string[] }) {
         setError(data.error ?? `request failed (${response.status})`);
         return;
       }
-      setResult(data);
+      // Keep the text that was scored, so the highlights can't drift out of
+      // sync with the textarea once the marketer starts editing.
+      setScored({ text: adText, result: data });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -53,9 +131,8 @@ export default function Scorer({ handles }: { handles: string[] }) {
     }
   }
 
-  const buckets = result
-    ? BUCKET_LABELS.filter(({ key }) => result[key].length > 0)
-    : [];
+  const findings = scored ? allFindings(scored.result) : [];
+  const firedCount = new Set(findings.map((f) => f.id)).size;
 
   return (
     <main style={{ maxWidth: 720, margin: "0 auto", padding: 24, lineHeight: 1.5 }}>
@@ -93,24 +170,26 @@ export default function Scorer({ handles }: { handles: string[] }) {
         </button>
       </div>
 
-      {error && (
-        <p style={{ marginTop: 24, color: "#b00" }}>
-          {error}
-        </p>
-      )}
+      {error && <p style={{ marginTop: 24, color: "#b00" }}>{error}</p>}
 
-      {result && (
+      {scored && (
         <section style={{ marginTop: 32 }}>
-          <p style={{ fontSize: 40, fontWeight: 700, margin: 0 }}>{result.verdict}</p>
+          <p style={{ fontSize: 40, fontWeight: 700, margin: 0 }}>{scored.result.verdict}</p>
+          <p style={{ margin: "4px 0 0", opacity: 0.7 }}>
+            {scored.result.rules_checked} rules checked, {firedCount} fired.
+          </p>
 
-          {buckets.length === 0 && (
-            <p style={{ marginTop: 8 }}>No rules fired. Five rules exist, so this is not a compliance sign-off.</p>
-          )}
+          <MarkedUpAd adText={scored.text} findings={findings} />
 
-          {buckets.map(({ key, label }) => (
+          {BUCKETS.map(({ key, label }) => (
             <div key={key} style={{ marginTop: 24 }}>
-              <h2 style={{ fontSize: 14, textTransform: "uppercase", letterSpacing: 1 }}>{label}</h2>
-              {result[key].map((finding, i) => (
+              <h2 style={{ fontSize: 14, textTransform: "uppercase", letterSpacing: 1 }}>
+                {label}
+              </h2>
+              {scored.result[key].length === 0 && (
+                <p style={{ margin: 0, opacity: 0.7 }}>nothing fired</p>
+              )}
+              {scored.result[key].map((finding, i) => (
                 <div
                   key={`${finding.id}-${i}`}
                   style={{ border: "1px solid #ccc", padding: 12, marginTop: 8 }}
@@ -121,7 +200,7 @@ export default function Scorer({ handles }: { handles: string[] }) {
                   </p>
                   {finding.span && (
                     <p style={{ margin: "8px 0 0" }}>
-                      <span style={{ background: "#ffe58f" }}>{finding.span}</span>
+                      <span style={{ background: "#ffe58f", color: "#171717" }}>{finding.span}</span>
                     </p>
                   )}
                   {finding.fix && <p style={{ margin: "8px 0 0" }}>{finding.fix}</p>}
