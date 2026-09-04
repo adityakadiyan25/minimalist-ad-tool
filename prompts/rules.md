@@ -20,15 +20,23 @@ Fix: correct the number to match the product JSON.
 
 Why this is here: one of the brand's own live ads (ad-batch2-06.png, the 3-step acne routine, rightmost) says "Salicylic Acid + LHA 0.2%." The product JSON title says 2%. And they ran a whole ad (ad-batch2-01.png, middle) telling customers "It's still exactly 10%" when people asked if they'd cut the B5. The concentration is the thing this brand stakes itself on, so it's the one rule that gets checked in code, not by the model.
 
-## 2. Therapeutic verb on a disease — BLOCK
+## 2a. Therapeutic verb on a named condition — BLOCK
 
 Cure, treat, heal, or prevent, attached to a named medical condition. Acne vulgaris, eczema, dermatitis, psoriasis, rosacea. Block it.
 
 Doesn't fire when the object is a symptom or how skin looks. The brand's own ads say "prevent sun damage" (Glow Routine ad, ad-batch1-02.png middle), "reduces and prevents breakouts" (cleanser ad, ad-batch2-04.png left), "fades dark spots" (Vitamin C ad, ad-batch2-02.png right). All fine.
 
-Edge case: "heals" pointed at a body part is REVIEW not BLOCK. The 4-step routine ad (ad-batch2-05.png middle) says "heals and strengthens your skin barrier." It's over the line but I'm not blocking it until I've got the Schedule J text in evidence.
-
 Fix: swap the verb for what the ingredient does — reduces, helps, supports — and name the appearance, not the condition.
+
+Regulatory citation still pending. This is derived from the brand's behaviour, not from the D&C Rules.
+
+## 2b. Therapeutic verb on a body part — REVIEW
+
+Same verbs, but the object is a body part or a structure in the skin rather than a named condition. The 4-step routine ad (ad-batch2-05.png middle) says "heals and strengthens your skin barrier." It's over the line but I'm not blocking it until I've got the Schedule J text in evidence.
+
+Split out from 2a rather than left as an edge case inside it, because the scorer reads severity from this file by rule ID. One ID can't carry two severities.
+
+Fix: same as 2a.
 
 Regulatory citation still pending. This is derived from the brand's behaviour, not from the D&C Rules.
 
